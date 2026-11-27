@@ -7,10 +7,14 @@ on:
       - master
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Assemble Debug APK
     runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
 
     steps:
       - name: Checkout repository
@@ -28,9 +32,22 @@ jobs:
       - name: Build Debug APK
         run: gradle assembleDebug
 
-      - name: Upload app-debug.apk
+      - name: Copy app-debug.apk to repository root
+        run: cp -f app/build/outputs/apk/debug/app-debug.apk ./app-debug.apk
+
+      - name: Upload app-debug.apk artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+
+      - name: Commit and push app-debug.apk to repository root
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f ./app-debug.apk
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: update app-debug.apk [skip ci]"
+            git push
+          fi
