@@ -1,0 +1,6 @@
+{
+  "name": "HonorSound Studio",
+  "description": "System-wide Honor MagicOS 11 and Magic9 Pro Max audio DSP engine calibrated for Infinix Hot 60 5G.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
