@@ -86,21 +86,35 @@ class HonorMagicDspService : Service() {
             44f, 88f, 177f, 354f, 707f, 1414f, 2828f, 5657f, 11314f, 20000f
         )
 
-        // 3-Band Multi-Band Compressor upper cutoffs: Sub/Bass, Vocal/Mid, Air/Treble
-        private val MBC_UPPER_CUTOFF_HZ = floatArrayOf(220f, 3200f, 20000f)
+        // Flagship 3-Band Multi-Band Compressor crossovers:
+        // Low Band (<165 Hz), Mid Band (165 Hz - 3.4 kHz), High Band (>3.4 kHz)
+        private val MBC_UPPER_CUTOFF_HZ = floatArrayOf(165f, 3400f, 20000f)
 
-        // Infinix Hot 60 5G asymmetrical speaker compensation:
-        // Protects top punch-hole earpiece below 160 Hz & boosts +2.0 dB at ~2.1 kHz
-        private val INFINIX_SPEAKER_COMP_DB = floatArrayOf(
-            -10.0f, // 31 Hz: steep sub-bass excursion cut
-            -7.0f,  // 62 Hz: top earpiece protection
-            -2.5f,  // 125 Hz: <160 Hz transition roll-off
+        // Infinix Hot 60 5G Polycarbonate Boxiness & Shrillness Surgical Notches + Honor Air Lift
+        private val INFINIX_SPEAKER_BASE_COMP_DB = floatArrayOf(
+            -10.0f, // 31 Hz: steep sub-bass excursion guard
+            -4.5f,  // 62 Hz: main bottom speaker low-end control (Channel 0 receives -7.5 dB)
+            -2.0f,  // 125 Hz: <160 Hz excursion transition
+            -2.8f,  // 250 Hz: polycarbonate frame boxiness surgical notch
+            -2.2f,  // 500 Hz: hollow chestiness surgical notch
+            0.0f,   // 1000 Hz: clean mid bridge
+            2.4f,   // 2000 Hz: Honor open vocal presence lift
+            -1.8f,  // 4000 Hz: budget tweeter harshness surgical notch
+            0.8f,   // 8000 Hz: upper-air transition
+            2.6f    // 16000 Hz: Honor Magic9 Pro Max airy brilliance
+        )
+
+        // Channel 0 (Top Punch-Hole Earpiece / Left) differential compensation in Speaker Mode
+        private val INFINIX_TOP_EARPIECE_OFFSET_DB = floatArrayOf(
+            -1.5f,  // 31 Hz: extra sub-bass protection for small earpiece
+            -3.0f,  // 62 Hz: combined -7.5 dB cut on Channel 0
+            -1.5f,  // 125 Hz: tighter <160 Hz high-pass slope
             0.0f,   // 250 Hz
             0.0f,   // 500 Hz
-            0.4f,   // 1000 Hz
-            2.0f,   // 2000 Hz: +2.0 dB presence & dual-speaker symmetry
-            0.6f,   // 4000 Hz: smooth 2.1 kHz shoulder
-            0.0f,   // 8000 Hz
+            2.2f,   // 1000 Hz: top-earpiece midrange presence match
+            2.8f,   // 2000 Hz: top-earpiece vocal clarity match
+            2.0f,   // 4000 Hz: top-earpiece dispersion & brightness match
+            0.4f,   // 8000 Hz
             0.0f    // 16000 Hz
         )
 
@@ -173,6 +187,13 @@ class HonorMagicDspService : Service() {
         val packageName: String,
         val appLabel: String,
         val origin: String
+    )
+
+    private data class FletcherMunsonSubContour(
+        val gain31HzDb: Float,
+        val gain62HzDb: Float,
+        val gain125HzDb: Float,
+        val lowBandRatio: Float
     )
 
     data class DspEngineState(
@@ -885,10 +906,10 @@ class HonorMagicDspService : Service() {
                 DynamicsProcessing.MbcBand(
                     true,
                     MBC_UPPER_CUTOFF_HZ[band],
-                    10.0f,
-                    120.0f,
-                    2.0f,
-                    -18.0f,
+                    12.0f,
+                    110.0f,
+                    2.8f,
+                    -19.0f,
                     6.0f,
                     -80.0f,
                     1.0f,
@@ -922,12 +943,16 @@ class HonorMagicDspService : Service() {
     private fun applyDspParametersLocked(engineState: DspEngineState) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return
 
-        val effectivePostEq = computePostEqCurve(engineState)
-        _state.update { it.copy(lastEffectivePostEqDb = effectivePostEq.toList()) }
+        val leftPostEq = computePostEqCurve(engineState, channelIndex = 0)
+        val rightPostEq = computePostEqCurve(engineState, channelIndex = 1)
+        val displayPostEq = FloatArray(10) { i ->
+            ((leftPostEq[i] + rightPostEq[i]) * 0.5f).coerceIn(-15.0f, 15.0f)
+        }
+        _state.update { it.copy(lastEffectivePostEqDb = displayPostEq.toList()) }
 
         synchronized(dspLock) {
             for ((_, dp) in attachedEffects) {
-                applySingleEffectParameters(dp, engineState, effectivePostEq)
+                applySingleEffectParameters(dp, engineState, leftPostEq, rightPostEq)
             }
         }
     }
@@ -936,15 +961,14 @@ class HonorMagicDspService : Service() {
     private fun applySingleEffectParameters(
         dp: DynamicsProcessing,
         engineState: DspEngineState,
-        precomputedPostEq: FloatArray = computePostEqCurve(engineState)
+        leftPostEq: FloatArray = computePostEqCurve(engineState, channelIndex = 0),
+        rightPostEq: FloatArray = computePostEqCurve(engineState, channelIndex = 1)
     ) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return
 
         runCatching {
             val isBypassed = engineState.masterBypass
 
-            // Keep hardware effect enabled cleanly and use zeroed neutral gains on bypass
-            // or toggle enabled state cleanly without recreating the native effect.
             if (isBypassed) {
                 dp.setInputGainAllChannelsTo(0.0f)
                 for (i in 0 until 10) {
@@ -958,8 +982,8 @@ class HonorMagicDspService : Service() {
                         DynamicsProcessing.MbcBand(
                             false,
                             MBC_UPPER_CUTOFF_HZ[i],
-                            10.0f,
-                            120.0f,
+                            12.0f,
+                            110.0f,
                             1.0f,
                             0.0f,
                             6.0f,
@@ -994,26 +1018,29 @@ class HonorMagicDspService : Service() {
             val preGainDb = engineState.ultimateVolumePreGainDb.coerceIn(0.0f, 15.0f)
             dp.setInputGainAllChannelsTo(preGainDb)
 
-            // 2. 10-Band Pre-EQ: User/Preset EQ + Bass Boost + Dual 1216 AI Surround Subwoofer
+            // 2. Fletcher-Munson Dynamic Loudness Bass Contour + 10-Band Pre-EQ
+            val subContour = computeFletcherMunsonSubContour(
+                volumeStep = engineState.ultimateVolumeStep,
+                surroundEnabled = engineState.surroundSubwooferEnabled
+            )
             val bassBoost = engineState.bassBoostDb.coerceIn(0.0f, 6.0f)
-            val subBoost = if (engineState.surroundSubwooferEnabled) 1.0f else 0.0f
+
             for (i in 0 until 10) {
                 val baseGain = engineState.eqBandsDb.getOrElse(i) { 0.0f }.coerceIn(-12.0f, 12.0f)
-                val bassShelf = when (i) {
-                    0 -> bassBoost * 1.00f + subBoost * 3.2f
-                    1 -> bassBoost * 0.85f + subBoost * 2.4f
-                    2 -> bassBoost * 0.45f + subBoost * 1.0f
+                val bassContourGain = when (i) {
+                    0 -> bassBoost * 0.90f + subContour.gain31HzDb
+                    1 -> bassBoost * 0.85f + subContour.gain62HzDb
+                    2 -> bassBoost * 0.50f + subContour.gain125HzDb
                     else -> 0.0f
                 }
-                val clampedPreGain = (baseGain + bassShelf).coerceIn(-15.0f, 15.0f)
+                val clampedPreGain = (baseGain + bassContourGain).coerceIn(-15.0f, 15.0f)
                 dp.setPreEqBandAllChannelsTo(
                     i,
                     DynamicsProcessing.EqBand(true, EQ_UPPER_CUTOFF_HZ[i], clampedPreGain)
                 )
             }
 
-            // 3. 3-Band Multi-Band Compressor:
-            //    Combines Night Mode dynamic leveling + Dual 1216 Spatial Field + MLBB punch
+            // 3. Flagship 3-Band Multi-Band Compressor (Low <165 Hz, Mid 165-3.4 kHz, High >3.4 kHz)
             val spatial = engineState.spatialFieldLevel.coerceIn(0.0f, 1.0f)
             val night = engineState.nightModeEnabled
             val isMlbb = engineState.activePreset == MagicPreset.MLBB_COMPETITIVE
@@ -1023,20 +1050,22 @@ class HonorMagicDspService : Service() {
                     bandIndex = band,
                     nightMode = night,
                     subwoofer = engineState.surroundSubwooferEnabled,
+                    lowBandRatio = subContour.lowBandRatio,
                     spatialLevel = spatial,
                     mlbbCompetitive = isMlbb
                 )
                 dp.setMbcBandAllChannelsTo(band, mbcBand)
             }
 
-            // 4. 10-Band Post-EQ:
-            //    Infinix Hot 60 5G Hardware Compensation + Voice Forward + AI Privacy Call + Spatial Air
+            // 4. Per-Channel 10-Band Post-EQ:
+            //    Channel 0 (Left / Top Punch-Hole Earpiece) & Channel 1 (Right / Bottom Main Speaker)
+            //    with Infinix Hot 60 5G surgical notches + Symmetrical Dual 1216 balance + Transaural widening
             for (i in 0 until 10) {
-                val postGain = precomputedPostEq[i].coerceIn(-15.0f, 15.0f)
-                dp.setPostEqBandAllChannelsTo(
-                    i,
-                    DynamicsProcessing.EqBand(true, EQ_UPPER_CUTOFF_HZ[i], postGain)
-                )
+                val cutoff = EQ_UPPER_CUTOFF_HZ[i]
+                val leftGain = leftPostEq[i].coerceIn(-15.0f, 15.0f)
+                val rightGain = rightPostEq[i].coerceIn(-15.0f, 15.0f)
+                dp.setPostEqBandByChannelIndex(0, i, DynamicsProcessing.EqBand(true, cutoff, leftGain))
+                dp.setPostEqBandByChannelIndex(1, i, DynamicsProcessing.EqBand(true, cutoff, rightGain))
             }
 
             // 5. Final Zero-Clip Brickwall Limiter (-0.2 dB)
@@ -1057,11 +1086,45 @@ class HonorMagicDspService : Service() {
         }
     }
 
+    private fun computeFletcherMunsonSubContour(
+        volumeStep: Int,
+        surroundEnabled: Boolean
+    ): FletcherMunsonSubContour {
+        if (!surroundEnabled) {
+            return FletcherMunsonSubContour(
+                gain31HzDb = 0.0f,
+                gain62HzDb = 0.0f,
+                gain125HzDb = 0.0f,
+                lowBandRatio = 2.0f
+            )
+        }
+
+        val step = volumeStep.coerceIn(0, 150).toFloat()
+        // Smoothstep transition between 75% and 85% Ultimate Volume:
+        // 0-75%: rich Dual-1216 subwoofer warmth (+4.2 dB @ 62 Hz, +3.2 dB @ 125 Hz, 2.8:1 compression)
+        // 85-150%: tighten sub-85 Hz excursion (+1.5 dB @ 62 Hz, +3.8 dB @ 125 Hz) to prevent chassis rattle
+        val t = ((step - 75.0f) / 10.0f).coerceIn(0.0f, 1.0f)
+        val smooth = t * t * (3.0f - 2.0f * t)
+
+        val gain31 = 3.2f + (0.6f - 3.2f) * smooth
+        val gain62 = 4.2f + (1.5f - 4.2f) * smooth
+        val gain125 = 3.2f + (3.8f - 3.2f) * smooth
+        val ratio = 2.8f + (3.4f - 2.8f) * smooth
+
+        return FletcherMunsonSubContour(
+            gain31HzDb = gain31,
+            gain62HzDb = gain62,
+            gain125HzDb = gain125,
+            lowBandRatio = ratio
+        )
+    }
+
     @RequiresApi(Build.VERSION_CODES.P)
     private fun buildMbcBand(
         bandIndex: Int,
         nightMode: Boolean,
         subwoofer: Boolean,
+        lowBandRatio: Float,
         spatialLevel: Float,
         mlbbCompetitive: Boolean
     ): DynamicsProcessing.MbcBand {
@@ -1078,11 +1141,21 @@ class HonorMagicDspService : Service() {
                 1 -> 3.8f
                 else -> 3.5f
             }
+            val attack = when (bandIndex) {
+                0 -> 10.0f
+                1 -> 18.0f
+                else -> 8.0f
+            }
+            val release = when (bandIndex) {
+                0 -> 130.0f
+                1 -> 160.0f
+                else -> 100.0f
+            }
             return DynamicsProcessing.MbcBand(
                 true,
                 cutoff,
-                5.0f,
-                180.0f,
+                attack,
+                release,
                 ratio,
                 threshold,
                 8.0f,
@@ -1095,15 +1168,15 @@ class HonorMagicDspService : Service() {
 
         return when (bandIndex) {
             0 -> {
-                // Band 0 (0..220 Hz): Sub-bass & Dual 1216 Subwoofer control
-                val subPre = if (subwoofer) 1.5f else 0.0f
-                val subPost = if (subwoofer) 1.5f else 0.0f
+                // Low Band (<165 Hz): 12 ms attack / 110 ms release, 2.8:1+ tight drum kick punch
+                val subPre = if (subwoofer) 1.2f else 0.0f
+                val subPost = if (subwoofer) 1.4f else 0.0f
                 DynamicsProcessing.MbcBand(
                     true,
                     cutoff,
                     12.0f,
-                    130.0f,
-                    if (subwoofer) 2.4f else 1.8f,
+                    110.0f,
+                    lowBandRatio.coerceIn(1.5f, 4.0f),
                     -20.0f,
                     6.0f,
                     -80.0f,
@@ -1113,64 +1186,90 @@ class HonorMagicDspService : Service() {
                 )
             }
             1 -> {
-                // Band 1 (220..3200 Hz): Vocal body, footstep transients & spatial punch
-                val midPunch = (spatialLevel * 1.4f) + (if (mlbbCompetitive) 1.0f else 0.0f)
+                // Mid Band (165 Hz - 3.4 kHz): 25 ms attack / 140 ms release with +1.5 dB forward vocal clarity
+                val midPost = 1.5f + (spatialLevel * 0.6f) + (if (mlbbCompetitive) 0.9f else 0.0f)
                 DynamicsProcessing.MbcBand(
                     true,
                     cutoff,
-                    if (mlbbCompetitive) 6.0f else 10.0f,
-                    100.0f,
-                    if (mlbbCompetitive) 2.6f else 2.0f,
+                    25.0f,
+                    140.0f,
+                    if (mlbbCompetitive) 2.5f else 2.1f,
                     -18.0f,
                     6.0f,
                     -80.0f,
                     1.0f,
                     0.0f,
-                    midPunch.coerceIn(0.0f, 4.0f)
+                    midPost.coerceIn(0.0f, 4.0f)
                 )
             }
             else -> {
-                // Band 2 (3200..20000 Hz): Spatial air & crispness
-                val airGain = (spatialLevel * 2.2f) + (if (mlbbCompetitive) 0.8f else 0.0f)
+                // High Band (>3.4 kHz): 8 ms attack / 80 ms release for silky cymbal air
+                val airPost = 0.6f + (spatialLevel * 1.8f) + (if (mlbbCompetitive) 0.6f else 0.0f)
                 DynamicsProcessing.MbcBand(
                     true,
                     cutoff,
                     8.0f,
-                    90.0f,
+                    80.0f,
                     2.0f,
                     -19.0f,
                     6.0f,
                     -80.0f,
                     1.0f,
                     0.0f,
-                    airGain.coerceIn(0.0f, 4.0f)
+                    airPost.coerceIn(0.0f, 4.0f)
                 )
             }
         }
     }
 
-    private fun computePostEqCurve(engineState: DspEngineState): FloatArray {
+    private fun computePostEqCurve(
+        engineState: DspEngineState,
+        channelIndex: Int
+    ): FloatArray {
         val result = FloatArray(10)
 
-        // 1. Infinix Hot 60 5G hardware output compensation
         val deviceComp = when (engineState.activeOutputDevice) {
-            AudioOutputDevice.BUILT_IN_SPEAKER -> INFINIX_SPEAKER_COMP_DB
+            AudioOutputDevice.BUILT_IN_SPEAKER -> INFINIX_SPEAKER_BASE_COMP_DB
             AudioOutputDevice.BLUETOOTH -> BLUETOOTH_54_COMP_DB
             AudioOutputDevice.WIRED_HEADSET -> WIRED_HIRES_COMP_DB
         }
 
-        // 2. Voice Forward (0..6 dB bell centered on 1 kHz - 2.5 kHz)
+        val isSpeakerLeftEarpiece =
+            engineState.activeOutputDevice == AudioOutputDevice.BUILT_IN_SPEAKER &&
+                channelIndex == 0
+
         val voiceForward = engineState.voiceForwardDb.coerceIn(0.0f, 6.0f)
-
-        // 3. Spatial Field upper-mid & air expansion
         val spatial = engineState.spatialFieldLevel.coerceIn(0.0f, 1.0f)
-
-        // 4. AI Privacy Call Mode (cuts >3.5 kHz leakage, boosts 1.2-2.8 kHz close-ear clarity)
         val privacy = engineState.aiPrivacyCallEnabled
 
         for (i in 0 until 10) {
             var gain = deviceComp[i]
 
+            // Symmetrical Top-Earpiece Balance (Channel 0 / Left) in Speaker Mode
+            if (isSpeakerLeftEarpiece) {
+                gain += INFINIX_TOP_EARPIECE_OFFSET_DB[i]
+            }
+
+            // Transaural Stereo Widening complementary inter-aural tilt in Speaker Mode
+            if (engineState.activeOutputDevice == AudioOutputDevice.BUILT_IN_SPEAKER && spatial > 0.0f) {
+                gain += when {
+                    channelIndex == 0 && i == 7 -> spatial * 0.7f
+                    channelIndex == 0 && i == 8 -> spatial * 1.2f
+                    channelIndex == 1 && i == 8 -> spatial * 0.5f
+                    channelIndex == 1 && i == 9 -> spatial * 1.0f
+                    else -> 0.0f
+                }
+            } else {
+                // Headphone / Bluetooth Spatial Field air expansion
+                gain += when (i) {
+                    7 -> spatial * 0.8f
+                    8 -> spatial * 1.6f
+                    9 -> spatial * 2.0f
+                    else -> 0.0f
+                }
+            }
+
+            // Voice Forward (0..6 dB bell centered on 1 kHz - 2.5 kHz)
             gain += when (i) {
                 4 -> voiceForward * 0.25f // 500 Hz
                 5 -> voiceForward * 0.75f // 1000 Hz
@@ -1179,19 +1278,13 @@ class HonorMagicDspService : Service() {
                 else -> 0.0f
             }
 
-            gain += when (i) {
-                7 -> spatial * 1.0f // 4000 Hz
-                8 -> spatial * 1.8f // 8000 Hz
-                9 -> spatial * 2.2f // 16000 Hz
-                else -> 0.0f
-            }
-
+            // AI Privacy Call Mode (cuts >3.5 kHz leakage, boosts 1.2-2.8 kHz close-ear clarity)
             if (privacy) {
                 gain += when (i) {
                     0 -> -4.0f  // 31 Hz
                     1 -> -3.0f  // 62 Hz
-                    5 -> 2.5f   // 1000 Hz (1.2 kHz border)
-                    6 -> 4.5f   // 2000 Hz (1.2-2.8 kHz close-ear clarity)
+                    5 -> 2.5f   // 1000 Hz
+                    6 -> 4.5f   // 2000 Hz
                     7 -> -8.0f  // 4000 Hz (>3.5 kHz leakage cut)
                     8 -> -12.0f // 8000 Hz
                     9 -> -12.0f // 16000 Hz
@@ -1295,13 +1388,11 @@ class HonorMagicDspService : Service() {
 
                 val pcmBuffer = ShortArray(frameSamples)
 
-                // Lightweight single-pole filter state for zero-latency processing
                 var hpPrevX = 0.0f
                 var hpPrevY = 0.0f
                 var lpPrevY = 0.0f
                 var envFollower = 0.0f
 
-                // Precomputed filter coefficients at 48 kHz
                 val dt = 1.0f / SAMPLE_RATE_HZ
                 val hpIsoRc = 1.0f / (2.0f * PI.toFloat() * 140.0f)
                 val hpIsoAlpha = hpIsoRc / (hpIsoRc + dt)
@@ -1332,7 +1423,6 @@ class HonorMagicDspService : Service() {
 
                         val processed = when (mode) {
                             MicMonitorMode.NOISE_ISOLATION -> {
-                                // 140 Hz rumble cut + soft noise floor gate
                                 val hp = hpIsoAlpha * (hpPrevY + x - hpPrevX)
                                 hpPrevX = x
                                 hpPrevY = hp
@@ -1348,7 +1438,6 @@ class HonorMagicDspService : Service() {
                             }
 
                             MicMonitorMode.SUBJECT_VOICE_BOOST -> {
-                                // 300 Hz - 3.4 kHz vocal focus + clean soft-clipped boost
                                 val hp = hpVoiceAlpha * (hpPrevY + x - hpPrevX)
                                 hpPrevX = x
                                 hpPrevY = hp
@@ -1359,7 +1448,6 @@ class HonorMagicDspService : Service() {
                             }
 
                             MicMonitorMode.ARRI_AMBIENT -> {
-                                // Wideband cinematic ambient pass with 60 Hz wind filter
                                 val hp = hpArriAlpha * (hpPrevY + x - hpPrevX)
                                 hpPrevX = x
                                 hpPrevY = hp
